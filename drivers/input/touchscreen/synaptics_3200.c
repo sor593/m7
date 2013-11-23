@@ -53,41 +53,182 @@
 #define SYN_FW_TIMEOUT (30000)
 static DEFINE_MUTEX(syn_fw_mutex);
 
+struct synaptics_ts_data {
+	uint16_t addr;
+	struct i2c_client *client;
+	struct input_dev *input_dev;
+	struct input_dev *sr_input_dev;
+	struct workqueue_struct *syn_wq;
+	struct function_t *address_table;
+	int use_irq;
+	int gpio_irq;
+	int gpio_reset;
+	struct hrtimer timer;
+	struct work_struct  work;
+	uint16_t max[2];
+	uint32_t flags;
+	uint8_t num_function;
+	uint8_t finger_support;
+	uint16_t finger_pressed;
+	int (*power)(int on);
+	int (*lpm_power)(int on);
+	struct early_suspend early_suspend;
+	int pre_finger_data[11][4];
+	uint32_t debug_log_level;
+	uint32_t enable_noise_log;
+	uint32_t raw_base;
+	uint32_t raw_ref;
+	uint64_t timestamp;
+	uint16_t *filter_level;
+	uint8_t *reduce_report_level;
+	unsigned long tap_timeout[10];
+	int16_t *report_data;
+	uint8_t *temp_report_data;
+	uint8_t grip_suppression;
+	uint8_t grip_b_suppression;
+	uint16_t tap_suppression;
+	uint8_t ambiguous_state;
+	uint8_t diag_command;
+	uint8_t disable_CBC;
+	uint8_t cable_support;
+	uint8_t cable_config;
+	uint8_t key_number;
+	uint16_t key_postion_x[4];
+	uint16_t key_postion_y;
+	uint8_t intr_bit;
+	uint8_t finger_count;
+	uint8_t page_select;
+	uint8_t config_table[SYN_CONFIG_SIZE];
+	uint8_t x_channel;
+	uint8_t y_channel;
+	uint8_t *config;
+	uint32_t config_version;
+	uint16_t package_id;
+	uint32_t packrat_number;
+	int layout[4];
+	uint8_t htc_event;
+	atomic_t data_ready;
+	uint8_t relaxation;
+	uint8_t irq_enabled;
+	uint8_t large_obj_check;
+	uint8_t default_large_obj;
+	uint16_t tw_vendor;
+	uint16_t tw_pin_mask;
+	uint8_t support_htc_event;
+	uint8_t mfg_flag;
+	uint8_t first_pressed;
+	uint8_t segmentation_bef_unlock;
+	uint8_t segmentation_aft_unlock;
+	uint8_t psensor_status;
+	uint8_t i2c_err_handler_en;
+	uint8_t threshold_bef_unlock;
+	uint8_t threshold_aft_unlock;
+	uint16_t saturation_bef_unlock;
+	uint16_t saturation_aft_unlock;
+	uint8_t energy_ratio_relaxation;
+	uint8_t multitouch_calibration;
+	uint32_t width_factor;
+	uint32_t height_factor;
+	uint8_t finger_func_idx;
+	uint8_t psensor_detection;
+	uint8_t psensor_resume_enable;
+	uint8_t psensor_phone_enable;
+	uint8_t PixelTouchThreshold_bef_unlock;
+	uint8_t PixelTouchThreshold_aft_unlock;
+	struct work_struct  psensor_work;
+	struct workqueue_struct *syn_psensor_wq;
+	struct synaptics_virtual_key *button;
+	wait_queue_head_t syn_fw_wait;
+	atomic_t syn_fw_condition;
+	uint8_t block_touch_time_near;
+	uint8_t block_touch_time_far;
+	uint8_t block_touch_event;
+};
+
+#ifdef CONFIG_HAS_EARLYSUSPEND
+static void synaptics_ts_early_suspend(struct early_suspend *h);
+static void synaptics_ts_late_resume(struct early_suspend *h);
+#endif
+
+static DECLARE_WAIT_QUEUE_HEAD(syn_data_ready_wq);
+static DEFINE_MUTEX(syn_mutex);
+
+static struct synaptics_ts_data *gl_ts;
+static uint16_t syn_panel_version;
+static uint8_t vk_press;
+
+static int i2c_syn_write_byte_data(struct i2c_client *client, uint16_t addr, uint8_t value);
+static int syn_pdt_scan(struct synaptics_ts_data *ts, int num_page);
+static int synaptics_init_panel(struct synaptics_ts_data *ts);
+
+static irqreturn_t synaptics_irq_thread(int irq, void *ptr);
+
+extern unsigned int get_tamper_sf(void);
+
+static DEFINE_MUTEX(syn_block_mutex);
+static void syn_block_touch(struct synaptics_ts_data *ts, int enable)
+{
+	mutex_lock(&syn_block_mutex);
+	ts->block_touch_event = enable;
+	mutex_unlock(&syn_block_mutex);
+	printk(KERN_INFO "[TP] Block Touch Event:%d\n", enable);
+}
+
+static void syn_block_touch_work_func(struct work_struct *dummy)
+{
+	struct synaptics_ts_data *ts = gl_ts;
+	syn_block_touch(ts, 0);
+}
+static DECLARE_DELAYED_WORK(syn_block_touch_work, syn_block_touch_work_func);
+
+static void syn_handle_block_touch(struct synaptics_ts_data *ts, int enable)
+{
+	int ret;
+	if (ts->block_touch_event) {
+		ret = __cancel_delayed_work(&syn_block_touch_work);
+		syn_block_touch(ts, 0);
+	}
+	if (enable) {
+		if (ts->block_touch_time_near && enable == 1) {
+			ret = schedule_delayed_work(&syn_block_touch_work, HZ*ts->block_touch_time_near/1000);
+			syn_block_touch(ts, 1);
+		}
+		if (ts->block_touch_time_far && enable == 2) {
+			ret = schedule_delayed_work(&syn_block_touch_work, HZ*ts->block_touch_time_far/1000);
+			syn_block_touch(ts, 1);
+		}
+	}
+}
 
 #ifdef CONFIG_TOUCHSCREEN_SYNAPTICS_SWEEP2WAKE
 
-#define S2W_START 30
-#define S2W_TIMEOUT 350
-#define S2W_TIMEOUT2 600
-#define S2W_TIMEOUT3 700
-#define L2M_TIMEOUT 300
-#define DT2W_TIMEOUT_MAX 300
-#define DT2W_TIMEOUT_MIN 150
-#define DT2W_DELTA 200
+#define S2W_START 3
+#define S2W_TIMEOUT 35
+#define S2W_TIMEOUT2 60
+#define S2W_TIMEOUT3 70
+#define L2M_TIMEOUT 30
+#define DT2W_TIMEOUT_MAX 55
+#define DT2W_TIMEOUT_MIN 10
+#define DT2W_DELTA 75
 #define L2W_TIMEOUT 50
 
-bool scr_suspended = false;
-int button_id = 0;
-int home_press_time = 0;
-int suppress_home = 0;
-int cancel_pwrtrigger = 0;
-int s2w_switch = 1;
-int l2m_switch = 1;
-int l2w_switch = 0;
-int dt2w_switch = 1;
-int pocket_detect = 1;
-int s2w_hist[2] = {0, 0};
-cputime64_t s2w_time[3] = {0, 0, 0};
-int l2m_hist[2] = {0, 0};
-cputime64_t l2m_time[2] = {0, 0};
-cputime64_t dt2w_time[2] = {0, 0};
-unsigned int dt2w_x[2] = {0, 0};
-unsigned int dt2w_y[2] = {0, 0};
-cputime64_t pwrtrigger_time[2] = {0, 0};
-int wakesleep_vib = 0;
-int vib_strength = 15;
+static bool scr_suspended = false;
+static int button_id = 0;
+static int s2w_switch = 1;
+static int l2m_switch = 1;
+static int l2w_switch = 0;
+static int dt2w_switch = 1;
+static int pocket_detect = 1;
+static int s2w_hist[2] = {0, 0};
+static unsigned long s2w_time[3] = {0, 0, 0};
+static unsigned long l2m_time[2] = {0, 0};
+static unsigned long dt2w_time[2] = {0, 0};
+static unsigned int dt2w_x[2] = {0, 0};
+static unsigned int dt2w_y[2] = {0, 0};
+static unsigned long pwrtrigger_time[2] = {0, 0};
+static int wakesleep_vib = 0;
+static int vib_strength = 15;
 static int break_longtap_count = 0;
-int button_timeout = 0;
 
 extern uint8_t touchscreen_is_on(void)
 {
@@ -102,14 +243,6 @@ static DEFINE_MUTEX(pwrkeyworklock);
 static DEFINE_MUTEX(longtap_count_lock);
 
 static void reset_sweep2wake (void) {
-        dt2w_time[0] = 0;
-        dt2w_time[1] = 0;
-
-        dt2w_x[0] = 0;
-        dt2w_x[1] = 0;
-        dt2w_y[0] = 0;
-        dt2w_y[1] = 0;
-
         s2w_time[0] = 0;
         s2w_time[1] = 0;
         s2w_time[2] = 0;
@@ -127,8 +260,6 @@ EXPORT_SYMBOL(sweep2wake_setdev);
 static void sweep2wake_presspwr(struct work_struct * sweep2wake_presspwr_work) {
 	int pocket_mode = 0;
 
-	reset_sweep2wake();
-
 	if (scr_suspended == true && pocket_detect == 1)
 		pocket_mode = power_key_check_in_pocket();
 
@@ -145,10 +276,10 @@ static void sweep2wake_presspwr(struct work_struct * sweep2wake_presspwr_work) {
         	        return;
 		input_event(sweep2wake_pwrdev, EV_KEY, KEY_POWER, 1);
 		input_event(sweep2wake_pwrdev, EV_SYN, 0, 0);
-		msleep(100);
+		msleep(60);
 		input_event(sweep2wake_pwrdev, EV_KEY, KEY_POWER, 0);
 		input_event(sweep2wake_pwrdev, EV_SYN, 0, 0);
-		msleep(100);
+		msleep(60);
         	mutex_unlock(&pwrkeyworklock);
 		return;
 	}
@@ -158,16 +289,15 @@ static DECLARE_WORK(sweep2wake_presspwr_work, sweep2wake_presspwr);
 void sweep2wake_pwrtrigger(void) {
 
         pwrtrigger_time[1] = pwrtrigger_time[0];
-        pwrtrigger_time[0] = ktime_to_ms(ktime_get());	
+        pwrtrigger_time[0] = jiffies;	
 
-	printk("[S2W] pwrtrigger2=%llu pwrtrigger1=%llu\n ", pwrtrigger_time[1], pwrtrigger_time[0]);
+	//printk("[S2W] pwrtrigger2=%llu pwrtrigger1=%llu\n ", pwrtrigger_time[1], pwrtrigger_time[0]);
 
-	if ((pwrtrigger_time[0] - pwrtrigger_time[1] < S2W_TIMEOUT3) && cancel_pwrtrigger != 2) {
-		printk("not enough time\n");
+	if (pwrtrigger_time[0] - pwrtrigger_time[1] < S2W_TIMEOUT3) {
+		//printk("not enough time\n");
 		return;
 	}
-	if (!cancel_pwrtrigger)
-		schedule_work(&sweep2wake_presspwr_work);
+	schedule_work(&sweep2wake_presspwr_work);
 
         return;
 }
@@ -180,10 +310,10 @@ static void logo2menu_pressmenu(struct work_struct * logo2menu_pressmenu_work) {
 
         input_event(ts->input_dev, EV_KEY, KEY_MENU, 1);
         input_sync(ts->input_dev);
-        msleep(100);
+        msleep(60);
         input_event(ts->input_dev, EV_KEY, KEY_MENU, 0);
         input_sync(ts->input_dev);
-        msleep(100);
+        msleep(60);
         return;
 }
 
@@ -352,153 +482,6 @@ static int __init get_vib_opt(char *vib)
 __setup("vib=", get_vib_opt);
 
 #endif
-
-struct synaptics_ts_data {
-	uint16_t addr;
-	struct i2c_client *client;
-	struct input_dev *input_dev;
-	struct input_dev *sr_input_dev;
-	struct workqueue_struct *syn_wq;
-	struct function_t *address_table;
-	int use_irq;
-	int gpio_irq;
-	int gpio_reset;
-	struct hrtimer timer;
-	struct work_struct  work;
-	uint16_t max[2];
-	uint32_t flags;
-	uint8_t num_function;
-	uint8_t finger_support;
-	uint16_t finger_pressed;
-	int (*power)(int on);
-	int (*lpm_power)(int on);
-	struct early_suspend early_suspend;
-	int pre_finger_data[11][4];
-	uint32_t debug_log_level;
-	uint32_t enable_noise_log;
-	uint32_t raw_base;
-	uint32_t raw_ref;
-	uint64_t timestamp;
-	uint16_t *filter_level;
-	uint8_t *reduce_report_level;
-	unsigned long tap_timeout[10];
-	int16_t *report_data;
-	uint8_t *temp_report_data;
-	uint8_t grip_suppression;
-	uint8_t grip_b_suppression;
-	uint16_t tap_suppression;
-	uint8_t ambiguous_state;
-	uint8_t diag_command;
-	uint8_t disable_CBC;
-	uint8_t cable_support;
-	uint8_t cable_config;
-	uint8_t key_number;
-	uint16_t key_postion_x[4];
-	uint16_t key_postion_y;
-	uint8_t intr_bit;
-	uint8_t finger_count;
-	uint8_t page_select;
-	uint8_t config_table[SYN_CONFIG_SIZE];
-	uint8_t x_channel;
-	uint8_t y_channel;
-	uint8_t *config;
-	uint32_t config_version;
-	uint16_t package_id;
-	uint32_t packrat_number;
-	int layout[4];
-	uint8_t htc_event;
-	atomic_t data_ready;
-	uint8_t relaxation;
-	uint8_t irq_enabled;
-	uint8_t large_obj_check;
-	uint8_t default_large_obj;
-	uint16_t tw_vendor;
-	uint16_t tw_pin_mask;
-	uint8_t support_htc_event;
-	uint8_t mfg_flag;
-	uint8_t first_pressed;
-	uint8_t segmentation_bef_unlock;
-	uint8_t segmentation_aft_unlock;
-	uint8_t psensor_status;
-	uint8_t i2c_err_handler_en;
-	uint8_t threshold_bef_unlock;
-	uint8_t threshold_aft_unlock;
-	uint16_t saturation_bef_unlock;
-	uint16_t saturation_aft_unlock;
-	uint8_t energy_ratio_relaxation;
-	uint8_t multitouch_calibration;
-	uint32_t width_factor;
-	uint32_t height_factor;
-	uint8_t finger_func_idx;
-	uint8_t psensor_detection;
-	uint8_t psensor_resume_enable;
-	uint8_t psensor_phone_enable;
-	uint8_t PixelTouchThreshold_bef_unlock;
-	uint8_t PixelTouchThreshold_aft_unlock;
-	struct work_struct  psensor_work;
-	struct workqueue_struct *syn_psensor_wq;
-	struct synaptics_virtual_key *button;
-	wait_queue_head_t syn_fw_wait;
-	atomic_t syn_fw_condition;
-	uint8_t block_touch_time_near;
-	uint8_t block_touch_time_far;
-	uint8_t block_touch_event;
-};
-
-#ifdef CONFIG_HAS_EARLYSUSPEND
-static void synaptics_ts_early_suspend(struct early_suspend *h);
-static void synaptics_ts_late_resume(struct early_suspend *h);
-#endif
-
-static DECLARE_WAIT_QUEUE_HEAD(syn_data_ready_wq);
-static DEFINE_MUTEX(syn_mutex);
-
-static struct synaptics_ts_data *gl_ts;
-static uint16_t syn_panel_version;
-static uint8_t vk_press;
-
-static int i2c_syn_write_byte_data(struct i2c_client *client, uint16_t addr, uint8_t value);
-static int syn_pdt_scan(struct synaptics_ts_data *ts, int num_page);
-static int synaptics_init_panel(struct synaptics_ts_data *ts);
-
-static irqreturn_t synaptics_irq_thread(int irq, void *ptr);
-
-extern unsigned int get_tamper_sf(void);
-
-static DEFINE_MUTEX(syn_block_mutex);
-static void syn_block_touch(struct synaptics_ts_data *ts, int enable)
-{
-	mutex_lock(&syn_block_mutex);
-	ts->block_touch_event = enable;
-	mutex_unlock(&syn_block_mutex);
-	printk(KERN_INFO "[TP] Block Touch Event:%d\n", enable);
-}
-
-static void syn_block_touch_work_func(struct work_struct *dummy)
-{
-	struct synaptics_ts_data *ts = gl_ts;
-	syn_block_touch(ts, 0);
-}
-static DECLARE_DELAYED_WORK(syn_block_touch_work, syn_block_touch_work_func);
-
-static void syn_handle_block_touch(struct synaptics_ts_data *ts, int enable)
-{
-	int ret;
-	if (ts->block_touch_event) {
-		ret = __cancel_delayed_work(&syn_block_touch_work);
-		syn_block_touch(ts, 0);
-	}
-	if (enable) {
-		if (ts->block_touch_time_near && enable == 1) {
-			ret = schedule_delayed_work(&syn_block_touch_work, HZ*ts->block_touch_time_near/1000);
-			syn_block_touch(ts, 1);
-		}
-		if (ts->block_touch_time_far && enable == 2) {
-			ret = schedule_delayed_work(&syn_block_touch_work, HZ*ts->block_touch_time_far/1000);
-			syn_block_touch(ts, 1);
-		}
-	}
-}
 
 static void syn_page_select(struct i2c_client *client, uint8_t page)
 {
@@ -2147,27 +2130,6 @@ static ssize_t synaptics_vib_strength_dump(struct device *dev, struct device_att
 
 static DEVICE_ATTR(vib_strength, 0666,
 	synaptics_vib_strength_show, synaptics_vib_strength_dump);
-
-
-static ssize_t synaptics_button_timeout_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	size_t count = 0;
-	count += sprintf(buf, "%d\n", button_timeout);
-	return count;
-}
-
-static ssize_t synaptics_button_timeout_dump(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
-{
-	sscanf(buf, "%d ",&button_timeout);
-	if (button_timeout < 0 || button_timeout > 15)
-		button_timeout = 6;
-
-	return count;
-}
-
-static DEVICE_ATTR(button_timeout, 0666,
-	synaptics_button_timeout_show, synaptics_button_timeout_dump);
-
 #endif
 
 enum SR_REG_STATE{
@@ -2322,13 +2284,6 @@ static int synaptics_touch_sysfs_init(void)
 		printk(KERN_ERR "%s: sysfs_create_file failed\n", __func__);
 		return ret;
 	}
-
-	ret = sysfs_create_file(android_touch_kobj, &dev_attr_button_timeout.attr);
-	if (ret) {
-		printk(KERN_ERR "%s: sysfs_create_file failed\n", __func__);
-		return ret;
-	} 
-
 #endif
 
 #ifdef SYN_WIRELESS_DEBUG
@@ -2384,7 +2339,6 @@ static void synaptics_touch_sysfs_remove(void)
 	sysfs_remove_file(android_touch_kobj, &dev_attr_logo2wake.attr);
 	sysfs_remove_file(android_touch_kobj, &dev_attr_pocket_detect.attr);
 	sysfs_remove_file(android_touch_kobj, &dev_attr_vib_strength.attr);
-	sysfs_remove_file(android_touch_kobj, &dev_attr_button_timeout.attr);
 #endif
 #ifdef SYN_WIRELESS_DEBUG
 	sysfs_remove_file(android_touch_kobj, &dev_attr_enabled.attr);
@@ -2502,20 +2456,21 @@ static int synaptics_init_panel(struct synaptics_ts_data *ts)
 
 #ifdef CONFIG_TOUCHSCREEN_SYNAPTICS_SWEEP2WAKE
 
-static void sweep2wake_func(int button_id, cputime64_t strigger_time) {
+static void sweep2wake_func(int button_id) {
 
         s2w_time[2] = s2w_time[1];
         s2w_time[1] = s2w_time[0];
-        s2w_time[0] = strigger_time;
+        s2w_time[0] = jiffies;
 
-		if (scr_suspended && s2w_hist[0] == 2)
-			s2w_hist[1] = 0;
-		else	
-			s2w_hist[1] = s2w_hist[0];
-        s2w_hist[0] = button_id;
+	if (scr_suspended && s2w_hist[0] == 2)
+		s2w_hist[1] = 0;
+	else	
+		s2w_hist[1] = s2w_hist[0];
+        
+	s2w_hist[0] = button_id;
 
-	printk("[S2W]: in func button id 1=%i, button id 2= %i\n", s2w_hist[0], s2w_hist[1]);
-	printk("[S2W]: in func button time1=%llu, button time2= %llu, button time3= %llu\n", s2w_time[0], s2w_time[1], s2w_time[2]);
+	//printk("[S2W]: in func button id 1=%i, button id 2= %i\n", s2w_hist[0], s2w_hist[1]);
+	//printk("[S2W]: in func button time1=%llu, button time2= %llu, button time3= %llu\n", s2w_time[0], s2w_time[1], s2w_time[2]);
 
 	if ((s2w_time[0]-s2w_time[2]) < S2W_TIMEOUT2 && !scr_suspended) {
 		printk("[S2W]: canceled by timeout2\n");
@@ -2525,38 +2480,28 @@ static void sweep2wake_func(int button_id, cputime64_t strigger_time) {
 	if ((s2w_time[0]-s2w_time[1]) < S2W_TIMEOUT && (s2w_time[0]-s2w_time[1]) > S2W_START) {
 
 		if (s2w_switch == 1 && (s2w_hist[1] == 1 && s2w_hist[0] == 2) && scr_suspended) {
-                printk("[S2W]: OFF->ON\n");
-				wakesleep_vib = 1;
-				cancel_pwrtrigger = 0;
-				sweep2wake_pwrtrigger();
-				return;
+                	//printk("[S2W]: OFF->ON\n");
+			wakesleep_vib = 1;
+			reset_sweep2wake();
+			sweep2wake_pwrtrigger();
+			return;
 
 		} else if ((s2w_hist[1] == 2 && s2w_hist[0] == 1) && !scr_suspended) {
-	            printk("[S2W]: ON->OFF\n");
-				//wakesleep_vib = 1;
-				cancel_pwrtrigger = 0;
-				sweep2wake_pwrtrigger();
-				return;
+	        	//printk("[S2W]: ON->OFF\n");
+			//wakesleep_vib = 1;
+			reset_sweep2wake();
+			sweep2wake_pwrtrigger();
+			return;
 
-		} else if ((s2w_hist[1] == 2 && s2w_hist[0] == 1) && scr_suspended) {
-				printk("[S2W]: ON->OFF (cancel, screen already off)\n");
-				cancel_pwrtrigger = 2;
-	            sweep2wake_pwrtrigger();
-				return;
-
-		} else if ((s2w_hist[1] == 1 && s2w_hist[0] == 2) && !scr_suspended) {
-			    printk("[S2W]: OFF->ON (cancel, screen already on)\n");
-				cancel_pwrtrigger = 1;
-	            sweep2wake_pwrtrigger();
-				return;
+		} else {
+			reset_sweep2wake();
+			return;
 		}
 	}
     return;
 }
 
 static void logo2menu_func(void) {
-
-	// printk(KERN_INFO "button id 1=%i, button id 2= %i\n", l2m_hist[0], l2m_hist[1]);
 
 	if (l2m_switch == 1 && scr_suspended == false && ((l2m_time[0]-l2m_time[1]) < L2M_TIMEOUT)) {
 		// printk("[L2M]: menu button activated\n");
@@ -2579,16 +2524,13 @@ static int last_touch_position_x = 0;
 static int last_touch_position_y = 0;
 
 static int report_htc_logo_area(int x, int y) {
-        cputime64_t ltrigger_time;
-
 	if (l2m_switch == 0 && l2w_switch == 0)
 		return 0;
 
 	if (last_touch_position_x > 620 && last_touch_position_x < 1150) {
 		if (last_touch_position_y > 2835 || (scr_suspended == true && last_touch_position_y > 2750)) {
-			ltrigger_time = ktime_to_ms(ktime_get());
 			l2m_time[1] = l2m_time[0];
-			l2m_time[0] = ltrigger_time;
+			l2m_time[0] = jiffies;
 			// printk("[L2M]: HTC button pressed\n");
 			return 1;
 		}
@@ -2597,13 +2539,13 @@ static int report_htc_logo_area(int x, int y) {
 	return 0;
 }
 
-static void dt2w_func(int x, int y, cputime64_t trigger_time) {
+static void dt2w_func(int x, int y) {
 
 	int delta_x = 0;
 	int delta_y = 0;
 
         dt2w_time[1] = dt2w_time[0];
-        dt2w_time[0] = trigger_time;
+        dt2w_time[0] = jiffies;
 
 	dt2w_x[1] = dt2w_x[0];
         dt2w_x[0] = x;
@@ -2617,7 +2559,7 @@ static void dt2w_func(int x, int y, cputime64_t trigger_time) {
 
         if (scr_suspended) {
 		if (
-		y < 2880 && y > 2100
+		y < 2880
 		&& x > 150 && x < 1470
 		&& ((dt2w_time[0]-dt2w_time[1]) > DT2W_TIMEOUT_MIN)
 		&& ((dt2w_time[0]-dt2w_time[1]) < DT2W_TIMEOUT_MAX)
@@ -2625,9 +2567,10 @@ static void dt2w_func(int x, int y, cputime64_t trigger_time) {
 		&& (abs(delta_y) < DT2W_DELTA)
 		) {
                        // printk("[DT2W]: OFF->ON\n");
-			wakesleep_vib = 1;
-			cancel_pwrtrigger = 0;
+			dt2w_time[0] = 0;
+			dt2w_time[1] = 0;
                         sweep2wake_pwrtrigger();
+			wakesleep_vib = 1;
 		}
 	}
         return;
@@ -2640,9 +2583,6 @@ static void synaptics_ts_finger_func(struct synaptics_ts_data *ts)
 	int ret;
 	uint8_t buf[ts->finger_support * 8 ], noise_index[10], noise_state = 0;
 	static int x_pos[10] = {0}, y_pos[10] = {0};
-
-//s2w
-	cputime64_t dt_trigger_time;
 
 	memset(buf, 0x0, sizeof(buf));
 	memset(noise_index, 0x0, sizeof(noise_index));
@@ -2799,7 +2739,11 @@ static void synaptics_ts_finger_func(struct synaptics_ts_data *ts)
 		}
 
 #ifdef CONFIG_TOUCHSCREEN_SYNAPTICS_SWEEP2WAKE
-      if ((((ts->finger_count > 0)?1:0) == 0) && ((l2m_switch == 1) || (l2w_switch == 1))) { 
+     if ((((ts->finger_count > 0)?1:0) == 0) && scr_suspended == true && dt2w_switch == 1) { 
+		dt2w_func(last_touch_position_x, last_touch_position_y);
+     }
+
+     if ((((ts->finger_count > 0)?1:0) == 0) && ((l2m_switch == 1) || (l2w_switch == 1))) { 
 
 		// released (supposedly before long tap happened), break long tap count work...
 		break_longtap_count = 1;
@@ -2807,11 +2751,6 @@ static void synaptics_ts_finger_func(struct synaptics_ts_data *ts)
 		allow_longtap_count = 1;
 		if (report_htc_logo_area(last_touch_position_x,last_touch_position_x))
 			logo2menu_func();
-      }
-
-      if ((((ts->finger_count > 0)?1:0) == 0) && scr_suspended == true && dt2w_switch == 1) { 
-		dt_trigger_time = ktime_to_ms(ktime_get());
-		dt2w_func(last_touch_position_x, last_touch_position_y, dt_trigger_time);
       }
 #endif 
 		if (ts->pre_finger_data[0][0] < 2 || finger_pressed) {
@@ -3136,11 +3075,6 @@ static void synaptics_ts_button_func(struct synaptics_ts_data *ts)
 	uint8_t data = 0;
 	uint16_t x_position = 0, y_position = 0;
 
-#ifdef CONFIG_TOUCHSCREEN_SYNAPTICS_SWEEP2WAKE
-    	cputime64_t strigger_time = 0;
-	suppress_home = 0;
-#endif
-
 	ret = i2c_syn_read(ts->client,
 		get_address_base(ts, 0x1A, DATA_BASE), &data, 1);
 	if (data) {
@@ -3198,7 +3132,6 @@ static void synaptics_ts_button_func(struct synaptics_ts_data *ts)
 			last_touch_position_x = 0;
 			last_touch_position_y = 0;
 			button_id = 2;
-			home_press_time = jiffies;
 #endif
 
 			if (ts->button) {
@@ -3241,24 +3174,7 @@ static void synaptics_ts_button_func(struct synaptics_ts_data *ts)
 
 #ifdef CONFIG_TOUCHSCREEN_SYNAPTICS_SWEEP2WAKE
 		if (s2w_switch == 1 || s2w_switch == 2) {
-
-			strigger_time = ktime_to_ms(ktime_get());
-			sweep2wake_func(button_id, strigger_time);
-				
-			if (!scr_suspended && button_id == 2 && (jiffies - home_press_time < button_timeout)) {
-				suppress_home = 1;
-				button_id = 1; 
-				printk("[S2W]: suppress home\n");
-
-				for (;;) {
-					if (home_press_time + 30 == jiffies)
-						break;
-				}				
-			}
-
-			if (!suppress_home)
-				button_id = 0;
-			home_press_time = 0;
+			sweep2wake_func(button_id);
 		}
 				
 	   if (!scr_suspended) {

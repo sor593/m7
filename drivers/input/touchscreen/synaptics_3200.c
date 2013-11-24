@@ -261,17 +261,12 @@ static void sweep2wake_presspwr(struct work_struct * sweep2wake_presspwr_work) {
 	int pocket_mode = 0;
 
 	if (scr_suspended == true && pocket_detect == 1)
-		pocket_mode = power_key_check_in_pocket();
+		pocket_mode = pocket_detection_check();
 
 	if (l2w_switch == 1)
 		break_longtap_count = 1;
 
 	if (!pocket_mode || pocket_detect == 0) {
-		if (wakesleep_vib) {
-		        vibrate(vib_strength);
-			wakesleep_vib = 0;
-		}
-
 		if (!mutex_trylock(&pwrkeyworklock))
         	        return;
 		input_event(sweep2wake_pwrdev, EV_KEY, KEY_POWER, 1);
@@ -281,6 +276,11 @@ static void sweep2wake_presspwr(struct work_struct * sweep2wake_presspwr_work) {
 		input_event(sweep2wake_pwrdev, EV_SYN, 0, 0);
 		msleep(60);
         	mutex_unlock(&pwrkeyworklock);
+
+		if (wakesleep_vib) {
+		        vibrate(vib_strength);
+			wakesleep_vib = 0;
+		}
 		return;
 	}
 }
@@ -359,7 +359,7 @@ static void logo2wake_longtap_count(struct work_struct * logo2wake_longtap_count
 		// printk(KERN_INFO "[L2W] sending event KEY_POWER 1\n");
 
 		if (pocket_detect == 1)
-			pocket_mode = power_key_check_in_pocket();
+			pocket_mode = pocket_detection_check();
 
 		if (!pocket_mode || pocket_detect == 0) {
 			vibrate(vib_strength);
